@@ -1,174 +1,134 @@
-import os, re
-
-from atproto import (
-    CAR,
-    AtUri,
-    Client,
-    client_utils,
-    FirehoseSubscribeReposClient,
-    firehose_models,
-    models,
-    parse_subscribe_repos_message,
-)
+import sqlite3
+import hashlib
+import feedparser
+from atproto import Client, models
+import ssl
 from dotenv import load_dotenv
-import requests
+import os
 
-# Load environment variables
+import grapheme
+
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# === Load .env file ===
 load_dotenv()
+BSKY_HANDLE = os.getenv("BSKY_HANDLE")
+BSKY_APP_PASSWORD = os.getenv("BSKY_APP_PASSWORD")
 
-# Bluesky credentials
-BLUESKY_USERNAME = os.getenv("BLUESKY_USERNAME")
-BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD")
+# === Check credentials ===
+if not BSKY_HANDLE or not BSKY_APP_PASSWORD:
+    raise RuntimeError("Missing BSKY_HANDLE or BSKY_APP_PASSWORD in .env file.")
 
-API_URL = os.getenv("IMAGINE_URL")
-COPYPASTA_API_URL = os.getenv("IMAGINE_COPYPASTA_URL")
+# === Configuration ===
+FEED_URL = "https://www.octranspo.com/en/feeds/updates-en/"
+DB_PATH = "rss_posts.db"
 
-# Create a Bluesky client
-client = Client("https://bsky.social")
-firehose = FirehoseSubscribeReposClient()
+# === Initialize Bluesky Client ===
+client = Client()
+client.login(BSKY_HANDLE, BSKY_APP_PASSWORD)
 
-def get_file_extension(file_path):
-    return os.path.splitext(file_path)[1]
+# === Database Setup ===
+conn = sqlite3.connect(DB_PATH)
+cur = conn.cursor()
 
-def name_in_text(text: str) -> bool:
-    return re.search(r'cc: dreambot', text, re.IGNORECASE) is not None
+cur.execute("""
+CREATE TABLE IF NOT EXISTS posts (
+    guid TEXT PRIMARY KEY,
+    pub_date TEXT,
+    hash TEXT,
+    post_uri TEXT,
+    post_cid TEXT
+)
+""")
+conn.commit()
 
-def extract_prompt(input_string: str) -> str:
-    pattern = r'(?i)\bgenerate\s*:\s*(.*)'  # Regex pattern to match variations of "generate:"
-    match = re.search(pattern, input_string)
-    if match:
-        return match.group(1).strip()  # Return the matched text, stripping leading and trailing whitespace
-    else:
-        return "Substring not found in the input string."
+def compute_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
-def extract_prompt_from_parent(input_string: str) -> str:
-    pattern = r'(?i)\b(?:generate|update)\s*:\s*(.*)'  # Updated regex pattern to match variations of "generate:" and "update:" in a case-insensitive manner with optional whitespace after the colon
-    match = re.search(pattern, input_string)
-    if match:
-        return match.group(1).strip()  # Return the matched text, stripping leading and trailing whitespace
-    else:
-        return "Substring not found in the input string. parent"
+def fetch_feed():
+    return feedparser.parse(FEED_URL)
 
+def get_stored_post(guid: str):
+    cur.execute("SELECT pub_date, hash, post_uri, post_cid FROM posts WHERE guid = ?", (guid,))
+    return cur.fetchone()
 
-def parse_thread(author_did, thread):
-    entries = []
-    stack = [thread]
+def store_post(guid: str, pub_date: str, content_hash: str, post_uri: str, post_cid: str):
+    cur.execute(
+        "REPLACE INTO posts (guid, pub_date, hash, post_uri, post_cid) VALUES (?, ?, ?, ?, ?)",
+        (guid, pub_date, content_hash, post_uri, post_cid)
+    )
+    conn.commit()
 
-    while stack:
-        current_thread = stack.pop()
+def truncate_post(text, max_graphemes=300):
+    if grapheme.length(text) <= max_graphemes:
+        return text
 
-        if current_thread is None:
-            continue
+    # Reserve space for ellipsis
+    allowed = max_graphemes - 3
+    trimmed = grapheme.slice(text, 0, allowed)
+    return trimmed + "..."
 
-        if current_thread.post.author.did == author_did:
-            print("parse thread\n")
-            print(current_thread.post.record.text)
-            entries.append(extract_prompt_from_parent(current_thread.post.record.text))
+def process_feed():
+    feed = fetch_feed()
+    if feed.bozo:
+        print("Error parsing feed:", feed.bozo_exception)
+        return
+    print(feed)
+    for entry in feed.entries:
+        guid = entry.guid
+        title = entry.title
+        description = entry.description.strip()
+        link = entry.link
+        pub_date = entry.published
 
-        stack.append(current_thread.parent)
+        # Combine all parts to form a unique content hash
+        # Truncate content to 300 chars
+        content = truncate_post(
+            title + "\n" + link + "\n" + description.replace("<p>", "").replace("</p>", "")
+        )
+        content_hash = compute_hash(content)
 
-    return entries
+        stored = get_stored_post(guid)
 
+                # Find where the link is in the text
+        start = content.find(link)
+        if start == -1:
+            # Link not found in content, skip adding facet
+            facet = None
+        else:
+            end = start + len(link)
+            # Create facet for hyperlink
+            facet = models.AppBskyRichtextFacet.Main(
+                features=[
+                    models.AppBskyRichtextFacet.Link(uri=content[start:end])
+                ],
+                index=models.AppBskyRichtextFacet.ByteSlice(byte_start=start, byte_end=end)
+            )
 
-def generate_image(prompts):
-    try:
-        response = requests.post(API_URL, json={"prompts": prompts})
-        response.raise_for_status()  # Raises exception for 4xx and 5xx status codes
-        return response.content
-    except requests.RequestException as e:
-        print(f"Error generating image: {e}")
-        return None
-
-def process_operation(
-    op: models.ComAtprotoSyncSubscribeRepos.RepoOp,
-    car: CAR,
-    commit: models.ComAtprotoSyncSubscribeRepos.Commit,
-) -> None:
-    uri = AtUri.from_str(f"at://{commit.repo}/{op.path}")
-
-    if op.action == "create":
-        if not op.cid:
-            return
-
-        record = car.blocks.get(op.cid)
-        if not record:
-            return
-
-        record = {
-            "uri": str(uri),
-            "cid": str(op.cid),
-            "author": commit.repo,
-            **record,
-        }
-
-        if uri.collection == models.ids.AppBskyFeedPost:
-            if name_in_text(record["text"]):
-                poster_profile = client.get_profile(actor=record["author"])
-                posts_in_thread = client.get_post_thread(uri=record["uri"])
-                # if record.get("reply"):
-                #     if record["reply"]["root"]["uri"]:
-                #         posts_in_thread = client.get_post_thread(uri=record["reply"]["root"]["uri"])
-                print("Posts in thread: ", posts_in_thread.model_dump_json())
-                # check if the bot was tagged in post or reply
-                entries = []
-                if posts_in_thread.thread.parent == None:
-                    entries.append(extract_prompt(record["text"]))
-                else:
-                    entries.append(extract_prompt_from_parent(record["text"]))
-                    entries.extend(parse_thread(posts_in_thread.thread.post.author.did, posts_in_thread.thread.parent))
-
-                print("Prompt: ", entries)
-
-                img = generate_image(entries)
-                # send a reply to the post
-                record_ref = {"uri": record["uri"], "cid": record["cid"]}
-                reply_ref = models.AppBskyFeedPost.ReplyRef(
-                    parent=record_ref, root=record_ref
+        if stored is None:
+            post = client.send_post(
+                text=content,
+                facets=[facet] if facet else None
+            )
+            
+            store_post(guid, pub_date, content_hash, post.uri, post.cid)
+            print(f"✅ Posted new: {title}")
+        else:
+            _, stored_hash, stored_uri, stored_cid = stored
+            if stored_hash != content_hash:
+                post = client.send_post(
+                    content,
+                    facets=[facet],
+                    reply_to=models.AppBskyFeedPost.ReplyRef(
+                        root=models.ComAtprotoRepoStrongRef.Main(uri=stored_uri, cid=stored_cid),
+                        parent=models.ComAtprotoRepoStrongRef.Main(uri=stored_uri, cid=stored_cid),
+                    ),
                 )
-                response_text = client_utils.TextBuilder()
-                response_text.text(f"Hey, @{poster_profile.handle}. Here's a image generated from your post. ")
-                # response_text.mention('account', posts_in_thread.thread.post.author.did)
-                # response_text.link('link', "https://oaidalleapiprodscus.blob.core.windows.net/private/org-tk2WweVzkr4IDSoWN3yXPYah/user-YlKkZu9RNJ7Ioaely2LTeGZa/img-89edeK9NCX5t2STXHDoJfNsD.png?st=2024-02-25T19%3A28%3A33Z&se=2024-02-25T21%3A28%3A33Z&sp=r&sv=2021-08-06&sr=b&rscd=inline&rsct=image/png&skoid=6aaadede-4fb3-4698-a8f6-684d7786b067&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2024-02-25T18%3A17%3A56Z&ske=2024-02-26T18%3A17%3A56Z&sks=b&skv=2021-08-06&sig=hvrnOK7efFk9pEPF/eMLix0Hip1IgRcHR8tb9Em6z5w%3D")
-                client.send_image(
-                    text=response_text,
-                    reply_to=reply_ref,
-                    image=img,
-                    image_alt=entries[-1].strip(),
-                )
-                return
+                store_post(guid, pub_date, content_hash, post.uri)
+                print(f"♻️ Replied with update: {title}")
+            else:
+                print(f"➖ No change: {title}")
 
-
-
-
-    if op.action == "delete":
-        # Process delete(s)
-        return
-
-    if op.action == "update":
-        # Process update(s)
-        return
-
-    return
-
-
-# No need to edit this function - it processes messages from the firehose
-def on_message_handler(message: firehose_models.MessageFrame) -> None:
-    commit = parse_subscribe_repos_message(message)
-    if not isinstance(
-        commit, models.ComAtprotoSyncSubscribeRepos.Commit
-    ) or not isinstance(commit.blocks, bytes):
-        return
-
-    car = CAR.from_bytes(commit.blocks)
-
-    for op in commit.ops:
-        process_operation(op, car, commit)
-
-
-def main() -> None:
-    client.login(BLUESKY_USERNAME, BLUESKY_PASSWORD)
-    print("🤖 Bot is listening")
-    firehose.start(on_message_handler)
-
+# === Run ===
 if __name__ == "__main__":
-    main()
+    process_feed()
