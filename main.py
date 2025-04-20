@@ -80,7 +80,9 @@ def process_feed():
         print("Error parsing feed:", feed.bozo_exception)
         return
     print(feed)
-    for entry in feed.entries:
+    # Sort entries by published date (oldest first)
+    sorted_entries = sorted(feed.entries, key=lambda x: x.published)
+    for entry in sorted_entries:
         guid = entry.guid
         title = clean_html(entry.title)
         description = clean_html(entry.description).strip()
@@ -91,7 +93,7 @@ def process_feed():
         # Truncate content to 300 chars
         tb = client_utils.TextBuilder()
         tb.text("⚠️ " + title + "\n")
-        tb.link(link, "🔗 Learn more")
+        tb.link("🔗 More details", link)
         tb.text("\n\n")
         tb.text(description)
         content = truncate_post(
@@ -120,7 +122,7 @@ def process_feed():
                     ),
                     facets=tb.build_facets(),
                 )
-                store_post(guid, pub_date, content_hash, post.uri)
+                store_post(guid, pub_date, content_hash, post.uri, post.cid)
                 print(f"♻️ Replied with update: {title}")
             else:
                 print(f"➖ No change: {title}")
