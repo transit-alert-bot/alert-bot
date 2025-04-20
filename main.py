@@ -1,12 +1,12 @@
 import sqlite3
 import hashlib
 import feedparser
-from atproto import Client, models
+from atproto import Client, models, client_utils
 import ssl
 from dotenv import load_dotenv
 import os
-
 import grapheme
+from bs4 import BeautifulSoup
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS posts (
 """)
 conn.commit()
 
+def clean_html(html_content: str) -> str:
+    soup = BeautifulSoup(html_content, 'html.parser')
+    return soup.get_text(separator=' ').strip()
+
 def compute_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
@@ -68,6 +72,8 @@ def truncate_post(text, max_graphemes=300):
     trimmed = grapheme.slice(text, 0, allowed)
     return trimmed + "..."
 
+
+
 def process_feed():
     feed = fetch_feed()
     if feed.bozo:
@@ -76,39 +82,29 @@ def process_feed():
     print(feed)
     for entry in feed.entries:
         guid = entry.guid
-        title = entry.title
-        description = entry.description.strip()
+        title = clean_html(entry.title)
+        description = clean_html(entry.description).strip()
         link = entry.link
         pub_date = entry.published
 
         # Combine all parts to form a unique content hash
         # Truncate content to 300 chars
+        tb = client_utils.TextBuilder()
+        tb.text("⚠️ " + title + "\n")
+        tb.link(link, "🔗 Learn more")
+        tb.text("\n\n")
+        tb.text(description)
         content = truncate_post(
-            title + "\n" + link + "\n" + description.replace("<p>", "").replace("</p>", "")
+            tb.build_text(),
         )
         content_hash = compute_hash(content)
 
         stored = get_stored_post(guid)
 
-                # Find where the link is in the text
-        start = content.find(link)
-        if start == -1:
-            # Link not found in content, skip adding facet
-            facet = None
-        else:
-            end = start + len(link)
-            # Create facet for hyperlink
-            facet = models.AppBskyRichtextFacet.Main(
-                features=[
-                    models.AppBskyRichtextFacet.Link(uri=content[start:end])
-                ],
-                index=models.AppBskyRichtextFacet.ByteSlice(byte_start=start, byte_end=end)
-            )
-
         if stored is None:
             post = client.send_post(
                 text=content,
-                facets=[facet] if facet else None
+                facets=tb.build_facets(),
             )
             
             store_post(guid, pub_date, content_hash, post.uri, post.cid)
@@ -118,11 +114,11 @@ def process_feed():
             if stored_hash != content_hash:
                 post = client.send_post(
                     content,
-                    facets=[facet],
                     reply_to=models.AppBskyFeedPost.ReplyRef(
                         root=models.ComAtprotoRepoStrongRef.Main(uri=stored_uri, cid=stored_cid),
                         parent=models.ComAtprotoRepoStrongRef.Main(uri=stored_uri, cid=stored_cid),
                     ),
+                    facets=tb.build_facets(),
                 )
                 store_post(guid, pub_date, content_hash, post.uri)
                 print(f"♻️ Replied with update: {title}")
