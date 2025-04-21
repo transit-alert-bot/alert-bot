@@ -82,7 +82,6 @@ def process_feed():
     if feed.bozo:
         print("Error parsing feed:", feed.bozo_exception)
         return
-    print(feed)
     # Sort entries by published date (oldest first)
     sorted_entries = sorted(feed.entries, key=lambda x: x.published)
     for entry in sorted_entries:
