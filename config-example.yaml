@@ -1,0 +1,6 @@
+# Allows for multiple endpoints
+# with separate handles and passwords
+endpoints:
+  - handle: handle.bsky.social
+    password: "****-****-****-****"
+    feed: https://example.org/feeds/rss/

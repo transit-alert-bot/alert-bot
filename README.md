@@ -1,4 +1,4 @@
-# OC Transpo Alerts Bot
+# Bluesky Transit Alert Bot
 
 This repository contains the code for oc-transpo-alerts.bsky.social, a automated bot providing alerts from OC Transpo's official website.
 
