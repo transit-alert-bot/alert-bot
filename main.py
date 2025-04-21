@@ -72,7 +72,10 @@ def truncate_post(text, max_graphemes=300):
     trimmed = grapheme.slice(text, 0, allowed)
     return trimmed + "..."
 
-
+def extract_first_image(html_content: str) -> str|None:
+    soup = BeautifulSoup(html_content, 'html.parser')
+    img = soup.find('img')
+    return img.get('src') if img else None
 
 def process_feed():
     feed = fetch_feed()
@@ -89,8 +92,17 @@ def process_feed():
         link = entry.link
         pub_date = entry.published
 
+        # Extract image if any
+        image_url = extract_first_image(entry.description)
+        images = []
+        if image_url:
+            try:
+                response = client.upload_blob(image_url)
+                images = [models.AppBskyEmbedImages.Image(alt="Alert image", image=response.blob)]
+            except Exception as e:
+                print(f"Failed to upload image: {e}")
+
         # Combine all parts to form a unique content hash
-        # Truncate content to 300 chars
         tb = client_utils.TextBuilder()
         tb.text("⚠️ " + title + "\n")
         tb.link("🔗 More details", link)
@@ -107,6 +119,7 @@ def process_feed():
             post = client.send_post(
                 text=content,
                 facets=tb.build_facets(),
+                embed=models.AppBskyEmbedImages.Main(images=images) if images else None
             )
             
             store_post(guid, pub_date, content_hash, post.uri, post.cid)
@@ -115,12 +128,13 @@ def process_feed():
             _, stored_hash, stored_uri, stored_cid = stored
             if stored_hash != content_hash:
                 post = client.send_post(
-                    content,
+                    text=content,
                     reply_to=models.AppBskyFeedPost.ReplyRef(
                         root=models.ComAtprotoRepoStrongRef.Main(uri=stored_uri, cid=stored_cid),
                         parent=models.ComAtprotoRepoStrongRef.Main(uri=stored_uri, cid=stored_cid),
                     ),
                     facets=tb.build_facets(),
+                    embed=models.AppBskyEmbedImages.Main(images=images) if images else None
                 )
                 store_post(guid, pub_date, content_hash, post.uri, post.cid)
                 print(f"♻️ Replied with update: {title}")
