@@ -5,6 +5,7 @@ from atproto import Client, models, client_utils
 import ssl
 import grapheme
 from bs4 import BeautifulSoup
+import requests
 import yaml
 
 ssl._create_default_https_context = ssl._create_unverified_context
